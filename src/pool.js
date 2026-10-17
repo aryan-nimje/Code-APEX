@@ -93,8 +93,10 @@ function reconcile(pool, findings, { source, rev, signals, reason, ruleMeta, pro
     Object.assign(t, {
       type: f.type, key: f.key, sev: f.sev, title: f.title, detail: f.detail, clash: f.clash,
       tags: f.tags || [], count: (f.tags || []).length || (f.rows || []).length, options: f.options, def: f.def || null,
-      softNote: f.softNote || null, source, sig, lastRev: rev,
+      softNote: f.softNote || null, source, sig, lastRev: rev, custom: f.custom || null,
     });
+    if (t.sig !== undefined && t.hintSig !== sig && t.hint) t.hint = null; // a hint is about the data it was given
+    t.hintSig = sig;
     if (t.status === 'resolved') {
       if (t.provisional && t.lastDecision && t.lastDecision.sig !== sig) {
         t.status = 'review'; t.decision = t.lastDecision; t.lastDecision = null;

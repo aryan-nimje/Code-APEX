@@ -50,3 +50,33 @@ const r = check(y);
 assert.ok(!fails(r).includes('cable') && r.accepted > 0, 'relaxed cable counted as accepted exception');
 
 console.log('checker tests passed');
+
+// ---- custom rules: the engine honours them, the checker catches a tampered result ----
+{
+  const RU = require('../src/rules');
+  const sel = (field, values) => ({ field, op: 'in', values });
+  const cust = [
+    { k: 'c1', n: 'Never mix AI and DI in one CIOC', on: 1, spec: { type: 'separate', a: sel('type', ['AI']), b: sel('type', ['DI']), scope: 'cioc' } },
+    { k: 'c2', n: 'Max 30 DO per CIOC', on: 1, spec: { type: 'limit', a: sel('type', ['DO']), max: 30, scope: 'cioc' } },
+    { k: 'c3', n: 'Each group in one cabinet', on: 1, spec: { type: 'together', by: 'grp', scope: 'cabinet' } },
+  ];
+  const meta2 = { ...meta, c1: { n: 'c1' }, c2: { n: 'c2' }, c3: { n: 'c3' } };
+  const res2 = engine.allocate(d.signals, on, H, d.relax, d.pins, RU.compile(cust));
+  const ck = (pl) => check({ ...base(), placements: pl, H: res2.H, spare: res2.spare, rulesMeta: meta2, customs: cust.map((c) => ({ id: c.k, name: c.n, spec: c.spec })) });
+  const fl = (c) => c.results.filter((r) => r.violations.length).map((r) => r.key);
+  const c0 = ck(res2.placements); if (c0.violations) console.log(res2.findings.map((f) => f.type + ':' + f.key), c0.results.filter((r) => r.violations.length).map((r) => [r.key, r.violations.slice(0, 2)]));
+  assert.strictEqual(res2.findings.length, 0, 'feasible custom rules raise no TQs');
+  assert.strictEqual(c0.violations, 0, 'custom rules honoured by the engine');
+  let pl = res2.placements.map((p) => ({ ...p }));
+  const ai = pl.find((p) => p.type === 'AI'), di = pl.find((p) => p.type === 'DI' && (p.cab !== ai.cab || p.cioc !== ai.cioc));
+  Object.assign(di, { cab: ai.cab, cioc: ai.cioc, bp: 7, ch: 9 });
+  assert.ok(fl(ck(pl)).includes('c1'), 'AI/DI mix detected');
+  pl = res2.placements.map((p) => ({ ...p }));
+  const dos = pl.filter((p) => p.type === 'DO').slice(0, 31);
+  dos.forEach((p, i) => Object.assign(p, { cab: 99, cioc: 0, bp: Math.floor(i / 11), ch: i % 11 }));
+  assert.ok(fl(ck(pl)).includes('c2'), 'DO limit break detected');
+  pl = res2.placements.map((p) => ({ ...p }));
+  const g = pl.find((p) => p.grp === 'G1'); g.cab = g.cab + 5;
+  assert.ok(fl(ck(pl)).includes('c3'), 'group split across cabinets detected');
+  console.log('custom rule checker tests passed');
+}

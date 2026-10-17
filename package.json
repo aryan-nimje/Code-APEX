@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/checker.test.js && node test/lifecycle.test.js && node src/fuzz.js 200",
+    "test": "node test/checker.test.js && node test/lifecycle.test.js && node test/userrules.test.js && node src/fuzz.js 200",
     "fuzz": "node src/fuzz.js 500",
     "samples": "node scripts/make-samples.js"
   },

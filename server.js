@@ -9,6 +9,9 @@ const svc = require('./src/service');
 const ingest = require('./src/ingest');
 const sample = require('./src/sample');
 const fuzz = require('./src/fuzz');
+const llm = require('./src/llm');
+const coderules = require('./src/coderules');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const PUB = path.join(__dirname, 'public');
@@ -82,6 +85,10 @@ on('DELETE', '/api/projects/:id/revs/last', (req, p, b, url) => {
 on('GET', '/api/projects/:id/pool', (req, p) => svc.summary(pid(p)));
 on('POST', '/api/projects/:id/scan', (req, p, b) => { const id = pid(p); svc.scan(id, b); return svc.summary(id); });
 on('POST', '/api/projects/:id/tqs/decide', (req, p, b) => { const id = pid(p); svc.decide(id, { ...b, who: who(req, b) }); return svc.summary(id); });
+on('POST', '/api/projects/:id/tqs/hint', async (req, p, b) => svc.hint(pid(p), b));
+on('POST', '/api/projects/:id/manual/check', async (req, p, b) => svc.manualCheck(pid(p), b));
+on('POST', '/api/projects/:id/manual/place', async (req, p, b) => svc.manualPlace(pid(p), { ...b, who: who(req, b) }));
+on('POST', '/api/projects/:id/manual/remove', async (req, p, b) => svc.manualRemove(pid(p), { ...b, who: who(req, b) }));
 on('POST', '/api/projects/:id/tqs/reopen', (req, p, b) => { const id = pid(p); svc.reopen(id, { ...b, who: who(req, b) }); return svc.summary(id); });
 
 // allocation (held while blocking TQs are open) + independent checker
@@ -90,6 +97,37 @@ on('GET', '/api/projects/:id/allocation', (req, p) => ({ result: svc.lastAllocat
 on('GET', '/api/projects/:id/export.csv', (req, p, b, url) => {
   const x = svc.exportCsv(pid(p), url.searchParams.get('pat'));
   return { __raw: x.csv, type: 'text/csv; charset=utf-8', headers: { 'Content-Disposition': `attachment; filename="${x.name}"` } };
+});
+
+// LLM rule drafter: name + description -> a draft rule (the user accepts or rejects it in the UI)
+on('POST', '/api/rules/draft', async (req, p, b) => {
+  const name = String(b.name || '').trim().slice(0, 120), description = String(b.description || '').trim().slice(0, 1000);
+  if (!name && !description) throw new Error('Give the rule a name or describe what it must do');
+  const ctx = { h: b.h || { cc: 4, bc: 8, pc: 12 }, types: Object.keys(b.hw || {}).slice(0, 40), groups: [], prefixes: [] };
+  if (b.project && pool.SAFE.test(b.project)) {
+    const pl = pool.load(b.project), r = pl.revs[pl.revs.length - 1];
+    if (r) {
+      ctx.groups = [...new Set(r.signals.map((s) => s.grp).filter(Boolean))].sort().slice(0, 60);
+      const pf = {};
+      r.signals.forEach((s) => { const m = String(s.tag).match(/^[A-Z0-9]+[-_]/); if (m) pf[m[0]] = (pf[m[0]] || 0) + 1; });
+      ctx.prefixes = Object.entries(pf).sort((x, y) => y[1] - x[1]).slice(0, 25).map((x) => x[0]);
+    }
+  }
+  const out = await llm.draft({ name, description, ctx });
+  if (!out.supported) return { supported: false, reason: out.reason };
+  const rule = { k: 'r' + crypto.randomBytes(4).toString('hex'), n: name || out.name, d: description || out.name, h: out.hard ? 1 : 0, on: 1, draft: 1 };
+  if (out.kind === 'code') Object.assign(rule, { code: out.code, summary: out.summary });
+  else rule.spec = out.spec;
+  // preview: what the rule would do to the current allocation of this project
+  let preview = null;
+  if (b.project && pool.SAFE.test(b.project)) {
+    const pl = pool.load(b.project), r = pl.revs[pl.revs.length - 1], res = r && r.alloc && r.alloc.result;
+    if (res && out.kind === 'code') {
+      const [x] = await coderules.run([{ id: 'p', code: out.code }], res.placements, res.H);
+      preview = x.error ? `The code failed on the current allocation: ${x.error}` : `On the current allocation it flags ${new Set(x.violations.flatMap((v) => v.tags)).size} signals in ${x.violations.length} violations.`;
+    }
+  }
+  return { supported: true, rule, explain: out.explain, preview };
 });
 
 // generalisation / fuzz testing
@@ -106,7 +144,7 @@ async function api(req, res, url) {
       if (out && out.__raw !== undefined) return send(res, 200, out.__raw, out.type, out.headers);
       return send(res, 200, out);
     } catch (e) {
-      return send(res, 400, { error: e.message });
+      return send(res, e.code >= 400 && e.code < 600 ? e.code : 400, { error: e.message });
     }
   }
   return send(res, 404, { error: 'not found' });

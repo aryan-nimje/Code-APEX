@@ -25,8 +25,9 @@ let POOL = null, RES = null, ING = null, MODAL = null, BUSY = '';
 
 const user = () => { try { return localStorage.getItem('ss-user') || 'engineer'; } catch (e) { return 'engineer'; } };
 const setUser = (v) => { try { localStorage.setItem('ss-user', v.trim().slice(0, 60)); } catch (e) { /* storage off */ } };
-const ctx = () => ({ rules: S.rules, hw: S.hw, h: S.h, who: user() });
-const akey = () => JSON.stringify([S.h, S.rules.map((r) => [r.k, !!r.on, !!r.h]), Object.keys(S.hw).sort()]);
+const live = () => S.rules.filter((r) => !r.draft);
+const ctx = () => ({ rules: live(), hw: S.hw, h: S.h, who: user() });
+const akey = () => JSON.stringify([S.h, live().map((r) => [r.k, !!r.on, !!r.h]), Object.keys(S.hw).sort()]);
 
 async function api(m, u, b) {
   const r = await fetch(u, { method: m, headers: { 'Content-Type': 'application/json', 'X-User': user() }, body: b ? JSON.stringify(b) : undefined });
@@ -70,6 +71,96 @@ function syncMeta() {
   if (!S.rev || !POOL.revs.some((x) => x.k === S.rev)) S.rev = r ? r.k : null;
 }
 
+// ---------- rules.json ----------
+// One self-contained file: the rule set (with priority order), the CHARM / terminal block lookup,
+// the cabinet hierarchy and the baseplate name pattern. Importing it reproduces the project's rules.
+// TQ decisions are not included: they belong to one IO list, not to the rule set.
+const RULES_FORMAT = 'signal-sudoku-rules';
+function rulesDoc() {
+  const pj = P();
+  return {
+    format: RULES_FORMAT, version: 1,
+    project: pj ? pj.name : '', exportedAt: new Date().toISOString(), exportedBy: user(),
+    revision: curRev() ? curRev().k : null,
+    hierarchy: { ciocsPerCabinet: S.h.cc, baseplatesPerCioc: S.h.bc, charmsPerBaseplate: S.h.pc },
+    namePattern: S.pat,
+    rules: live().map((r, i) => ({ id: r.k, name: r.n, description: r.d || '', hard: !!r.h, on: !!r.on, priority: i + 1, enforced: enforced(r), ...(r.spec ? { spec: r.spec } : {}), ...(r.code ? { code: r.code, summary: r.summary || '' } : {}) })),
+    hardware: Object.fromEntries(Object.entries(S.hw).map(([k, v]) => [k, { charm: v[0], terminalBlock: v[1] }])),
+  };
+}
+// Accepts the full rules.json object, or a bare list of rules (the older format). Throws a readable error.
+function applyRulesDoc(j) {
+  const doc = Array.isArray(j) ? { rules: j } : j;
+  if (!doc || typeof doc !== 'object' || !Array.isArray(doc.rules)) throw new Error('No "rules" list found');
+  if (doc.format && doc.format !== RULES_FORMAT) throw new Error('Not a Signal Sudoku rules file');
+  const seen = new Set();
+  const rules = [...doc.rules].sort((a, b) => (+a.priority || 0) - (+b.priority || 0)).map((r, i) => {
+    if (!r || typeof r !== 'object' || !String(r.name ?? '').trim()) throw new Error(`Rule ${i + 1} has no name`);
+    let k = String(r.id ?? '').trim() || 'x' + i;
+    while (seen.has(k)) k += '_';
+    seen.add(k);
+    return { k, n: String(r.name).trim().slice(0, 200), d: String(r.description || 'Imported').slice(0, 200), h: r.hard ? 1 : 0, on: r.on === false ? 0 : 1, ...(r.spec && typeof r.spec === 'object' ? { spec: r.spec } : {}), ...(typeof r.code === 'string' && r.code ? { code: r.code.slice(0, 6000), summary: String(r.summary || '').slice(0, 300) } : {}) };
+  });
+  const out = { rules };
+  if (doc.hardware && typeof doc.hardware === 'object') {
+    out.hw = {};
+    for (const [k, v] of Object.entries(doc.hardware)) {
+      const key = String(k).trim().toUpperCase();
+      if (!key) continue;
+      out.hw[key] = Array.isArray(v) ? [String(v[0] ?? ''), String(v[1] ?? '')] : [String((v && v.charm) ?? ''), String((v && v.terminalBlock) ?? '')];
+    }
+  }
+  if (doc.hierarchy) {
+    const g = (x) => { const n = Math.round(+x); if (!(n >= 1 && n <= 1000)) throw new Error('Hierarchy values must be 1 to 1000'); return n; };
+    out.h = { cc: g(doc.hierarchy.ciocsPerCabinet), bc: g(doc.hierarchy.baseplatesPerCioc), pc: g(doc.hierarchy.charmsPerBaseplate) };
+  }
+  if (typeof doc.namePattern === 'string' && doc.namePattern.trim()) out.pat = doc.namePattern.trim().slice(0, 60);
+  Object.assign(S, out);
+  return `${rules.length} rules${out.hw ? `, ${Object.keys(out.hw).length} IO types` : ''}${out.h ? ', hierarchy' : ''}${out.pat ? ', name pattern' : ''}`;
+}
+const slug = (x) => String(x || 'project').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'project';
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ---------- rule explanations (hover text) ----------
+const DR = { name: '', desc: '', busy: 0, msg: '', err: 0 }; // rule-drafting form state
+const BUILTIN = {
+  ab: 'Within a process group, Seg A and Seg B signals are never placed in the same CIOC.',
+  group: 'Each CIOC holds signals from one process group only.',
+  spare: 'At least 10% of the CHARMs on every baseplate stay free (rounded, minimum 1).',
+  cable: 'All pairs of a cable land in one CIOC, on consecutive CHARMs, in pair order.',
+  cap: 'With grouping on, all CIOCs of a process group sit in one cabinet.',
+};
+const FL = { type: 'IO type', grp: 'group', seg: 'segregation', cable: 'cable', tag: 'tag' };
+function selText(sel) {
+  if (!sel) return 'all signals';
+  const vs = sel.values.map((v) => (v === '' ? '(none)' : v)), list = vs.length > 1 ? vs.slice(0, -1).join(', ') + ' or ' + vs[vs.length - 1] : vs[0];
+  const t = sel.op === 'prefix' ? `signals whose ${FL[sel.field]} starts with ${list}` : { type: `${list} signals`, grp: `signals in group ${list}`, seg: `Seg ${list} signals`, cable: `signals on cable ${list}`, tag: `signals tagged ${list}` }[sel.field];
+  return sel.not ? `signals other than ${t}` : t;
+}
+function specText(s) {
+  const sc = { cioc: 'CIOC', baseplate: 'baseplate', cabinet: 'cabinet' }[s.scope];
+  const up = (x) => x[0].toUpperCase() + x.slice(1);
+  if (s.type === 'separate') return `${up(selText(s.a))} and ${selText(s.b)} are never placed in the same ${sc}.`;
+  if (s.type === 'exclusive') return `${up(selText(s.a))} get ${sc}s of their own; no other signal shares them.`;
+  if (s.type === 'limit') return `At most ${s.max} ${s.a ? selText(s.a) : 'signals'} per ${sc}.`;
+  if (s.type === 'together') return s.by ? `For each ${FL[s.by]}, its ${s.a ? selText(s.a) : 'signals'} are kept in one ${sc}.` : `All ${selText(s.a)} are kept in one ${sc}.`;
+  if (s.type === 'spare') return `At least ${s.percent}% of the CHARMs on every baseplate stay free (rounded, minimum 1).`;
+  return '';
+}
+const enforced = (r) => ENGINE.includes(r.k) || !!(r.spec && specText(r.spec)) || !!r.code;
+function explainRule(r) {
+  if (r.code) return `${r.summary || 'Generated code rule.'} Checked by generated code after allocation; it does not steer placement. Signals it flags become TQs for you to place by hand, accept, or leave unplaced. Not independently verified.`;
+  const what = BUILTIN[r.k] || (r.spec && specText(r.spec));
+  if (!what) return 'Stored only. The engine has no logic for this rule, so it is not enforced or checked.';
+  return what + (r.h ? ' Hard: if it cannot be met, a blocking TQ is raised.' : ' Soft: if it clashes, it is relaxed and logged as an exception.');
+}
+const draftRow = (r, i) => `<tr class="dr"><td><span class="tag h">Draft</span></td><td><span class="nm" data-tip="${E(explainRule(r))}" tabindex="0">${E(r.n)}</span><div style="font-size:12.5px;margin-top:2px">${E(r.code ? r.summary : specText(r.spec))}</div>${r.code ? `<div class="wn" style="font-size:12px">No standard rule type fits, so this was drafted as code. It is checked after allocation and does not steer placement.</div>${r.pv ? `<div class="mu" style="font-size:12px">${E(r.pv)}</div>` : ''}<details style="margin-top:4px"><summary class="mu" style="font-size:12px;cursor:pointer">View the generated code</summary><pre class="mono" style="white-space:pre-wrap;margin:6px 0 0;padding:8px;background:var(--bg);border:1px solid var(--ln);max-height:220px;overflow:auto">${E(r.code)}</pre></details>` : ''}<div class="mu" style="font-size:12px">From: “${E(r.d)}”</div></td><td><button class="tag ${r.h ? 'h' : ''}" data-a="hs" data-v="${i}">${r.h ? 'Hard' : 'Soft'}</button></td><td><span class="tag">${r.code ? 'Checked once accepted' : 'Enforced once accepted'}</span></td><td></td><td style="white-space:nowrap"><button class="btn s p" data-a="acc" data-v="${i}">Accept</button> <button class="btn s" data-a="rej" data-v="${i}">Reject</button></td></tr>`;
+
 // ---------- small render helpers ----------
 const kp = (a) => `<div class="kp">${a.map((x) => `<div><b>${x[0]}</b><span>${x[1]}</span></div>`).join('')}</div>`;
 const pn = (t, b) => `<div class="pn"><div class="ph">${t}</div><div class="pb">${b}</div></div>`;
@@ -87,8 +178,11 @@ function tqBody(t, compact) {
   const note = t.note ? `<div class="wn" style="font-size:12px;margin-top:4px">${E(t.note)}</div>` : '';
   const res = t.status === 'resolved' ? `<div class="mu" style="font-size:12px;margin-top:4px">Resolved by ${E(t.resolvedBy)}</div>` : '';
   const ctl = t.status === 'resolved' ? '' : `<div class="row tqx" style="margin-top:8px"><select data-tqsel aria-label="Decision for ${E(t.id)}">${t.options.map((o) => `<option value="${E(o.id)}" ${(t.decision ? t.decision.opt : t.def) === o.id ? 'selected' : ''}>${E(o.label)}</option>`).join('')}</select>${compact ? '' : '<input data-tqc placeholder="Note (optional)" style="width:170px">'}<button class="btn s p" data-a="dc" data-v="${E(t.fp)}">${t.decision ? 'Change' : 'Decide'}</button>${t.decision && !compact ? `<button class="btn s" data-a="ro" data-v="${E(t.fp)}">Withdraw</button>` : ''}</div>`;
-  return `<b>${E(t.title)}</b><div class="mu" style="font-size:12px">${E(t.detail)}</div>${dec}${def}${note}${res}${ctl}`;
+  const ur = t.custom ? `<span class="tag h" style="margin-right:6px" title="Raised by a rule you added; there are no rule-specific fixes, only the general options">User rule</span>` : '';
+  const hint = t.custom && t.status !== 'resolved' ? (t.hint ? `<div style="font-size:12px;margin-top:6px;padding:6px 8px;border-left:2px solid var(--ac);background:var(--p2)"><span class="mu">LLM hint, unverified:</span> ${E(t.hint.text)}</div>` : `<div style="margin-top:6px"><button class="btn s" data-a="hint" data-v="${E(t.fp)}" ${HB.has(t.fp) ? 'disabled' : ''}>${HB.has(t.fp) ? 'Getting a hint…' : 'Get a hint'}</button></div>`) : '';
+  return `${ur}<b>${E(t.title)}</b><div class="mu" style="font-size:12px">${E(t.detail)}</div>${dec}${def}${note}${res}${hint}${ctl}`;
 }
+const HB = new Set(); // TQs waiting for a hint
 
 // ---------- views ----------
 const V = {};
@@ -150,12 +244,14 @@ V.ru = () => {
   const rt = active().filter((t) => RULE_TQ.includes(t.type));
   const conflicts = rt.length ? `<div class="pn ${rt.some((t) => t.status !== 'decided') ? 'warn' : ''}"><div class="ph">Rule conflicts <span class="tag ${rt.some((t) => t.status !== 'decided' && t.sev === 'block') ? 'e' : 'w'}">${rt.length} data vs rule</span><span class="mu">from the data scan and the last allocation</span></div><div class="pb">${rt.slice(0, 8).map((t) => `<div class="tqc"><div class="row"><span class="mono mu">${E(t.id)}</span>${sevTag(t)}${stTag(t)}<span class="mono mu sp1">${E(t.clash)}</span></div>${tqBody(t)}</div>`).join('')}${rt.length > 8 ? `<p class="mu">${rt.length - 8} more in the TQ list.</p>` : ''}</div></div>` : '';
   return conflicts
-    + `<div class="pn"><div class="ph">Rule set <span class="mu">${R.filter((r) => r.on).length} of ${R.length} active</span><span class="sp1 row"><button class="btn s" data-a="js">${S.js ? 'Hide JSON' : 'JSON import / export'}</button></span></div>
-  ${S.js ? `<div class="pb"><textarea id="jsn" aria-label="Rules JSON">${E(JSON.stringify(R.map(({ k, n, h, on }) => ({ id: k, name: n, hard: !!h, on: !!on })), null, 1))}</textarea><div class="row" style="margin-top:8px"><button class="btn s p" data-a="jsap">Apply JSON</button><span class="mu mono">Paste a rule set to import</span></div></div>` : ''}
-  <div style="overflow-x:auto"><table><tr><th></th><th>Rule</th><th>Strength</th><th>Engine</th><th>Priority</th><th></th></tr>${R.map((r, i) => `<tr class="${r.on ? '' : 'off'} ${r.draft ? 'dr' : ''}"><td><button class="sw ${r.on ? 'on' : ''}" data-a="tg" data-v="${i}" aria-label="Switch rule"></button></td><td><span class="nm">${E(r.n)}</span><div class="mu" style="font-size:12px">${r.draft ? 'Filled from your description. Review, then accept.' : E(r.d)}</div></td><td>${r.draft ? `<button class="btn s p" data-a="acc" data-v="${i}">Accept</button>` : `<button class="tag ${r.h ? 'h' : ''}" data-a="hs" data-v="${i}" title="Hard rules raise blocking TQs; a clash with a soft rule proceeds by relaxing it">${r.h ? 'Hard' : 'Soft'}</button>`}</td><td>${ENGINE.includes(r.k) ? '<span class="tag g">Enforced</span>' : '<span class="tag w" title="The engine has no logic for this rule yet">Not enforced yet</span>'}</td><td class="mono">P${i + 1}</td><td style="white-space:nowrap"><button class="ib" data-a="mv" data-v="${i}" data-d="-1" aria-label="Up">▲</button><button class="ib" data-a="mv" data-v="${i}" data-d="1" aria-label="Down">▼</button><button class="ib" data-a="del" data-v="${i}" aria-label="Delete">✕</button></td></tr>`).join('')}</table></div>
-  <div class="pb" style="border-top:1px solid var(--ln)"><div class="row"><input class="w" id="rn" placeholder="Rule name"><select id="rk"><option>Hard</option><option>Soft</option></select><button class="btn" data-a="add">Add rule</button></div>
-  <div class="row" style="margin-top:10px"><input class="w" id="ait" placeholder="Or describe it: Keep all pump signals in one cabinet"><button class="btn p" data-a="ai">Fill rule</button></div>
-  <div class="row" style="margin-top:8px">${['Never mix AI and DI in one CIOC', 'Keep each unit in one cabinet', 'Reserve 20% spare per baseplate'].map((x) => `<button class="tag" data-a="eg" data-v="${x}">${x}</button>`).join('')}</div></div></div>`
+    + `<div class="pn"><div class="ph">Rule set <span class="mu">${live().filter((r) => r.on).length} of ${live().length} active${R.length > live().length ? ` · ${R.length - live().length} draft${R.length - live().length > 1 ? 's' : ''} to review` : ''}</span><span class="sp1 row"><button class="btn s" data-a="js">${S.js ? 'Hide JSON' : 'JSON import / export'}</button></span></div>
+  ${S.js ? `<div class="pb"><textarea id="jsn" aria-label="Rules JSON">${E(JSON.stringify(rulesDoc(), null, 1))}</textarea><div class="row" style="margin-top:8px"><button class="btn s p" data-a="jsap">Apply JSON</button><label class="btn s" style="cursor:pointer">Import rules.json<input type="file" id="rjf" accept=".json,application/json" hidden></label><button class="btn s" data-a="xr">Export rules.json</button><span class="mu mono">Paste or import a rule set; it replaces the rules, lookup, hierarchy and name pattern</span></div></div>` : ''}
+  <div style="overflow-x:auto"><table><tr><th></th><th>Rule <span class="mu" style="font-weight:400">hover a rule to see what it does</span></th><th>Strength</th><th>Engine</th><th>Priority</th><th></th></tr>${R.map((r, i) => r.draft ? draftRow(r, i) : `<tr class="${r.on ? '' : 'off'}"><td><button class="sw ${r.on ? 'on' : ''}" data-a="tg" data-v="${i}" aria-label="Switch rule"></button></td><td><span class="nm" data-tip="${E(explainRule(r))}" tabindex="0">${E(r.n)}</span><div class="mu" style="font-size:12px">${E(r.d)}</div></td><td><button class="tag ${r.h ? 'h' : ''}" data-a="hs" data-v="${i}" title="Hard rules raise blocking TQs; a clash with a soft rule proceeds by relaxing it">${r.h ? 'Hard' : 'Soft'}</button></td><td>${r.code ? '<span class="tag h" title="Generated code checks it after allocation; it does not steer placement">Code · checked after</span>' : enforced(r) ? '<span class="tag g">Enforced</span>' : '<span class="tag w" title="The engine has no logic for this rule">Not enforced</span>'}</td><td class="mono">P${R.filter((x, j) => !x.draft && j <= i).length}</td><td style="white-space:nowrap"><button class="ib" data-a="mv" data-v="${i}" data-d="-1" aria-label="Up">▲</button><button class="ib" data-a="mv" data-v="${i}" data-d="1" aria-label="Down">▼</button><button class="ib" data-a="del" data-v="${i}" aria-label="Delete">✕</button></td></tr>`).join('')}</table></div>
+  <div class="pb" style="border-top:1px solid var(--ln)"><div class="sec" style="text-transform:none;letter-spacing:0;font-size:12px">Add a rule: name it and describe what it must do. It is drafted for you to accept or reject.</div>
+  <div class="row"><input class="w" id="rn" placeholder="Rule name, e.g. Isolated outputs apart" maxlength="120" value="${E(DR.name)}"></div>
+  <div class="row" style="margin-top:8px"><textarea id="rdsc" placeholder="What the rule must do, e.g. DO isolated signals never share a baseplate with standard DO" maxlength="1000" style="height:64px">${E(DR.desc)}</textarea></div>
+  <div class="row" style="margin-top:8px"><button class="btn p" data-a="drf" ${DR.busy ? 'disabled' : ''}>${DR.busy ? 'Drafting…' : 'Draft rule'}</button>${DR.msg ? `<span class="${DR.err ? 'er' : 'wn'}" style="font-size:12.5px">${E(DR.msg)}</span>` : ''}</div>
+  <div class="row" style="margin-top:8px">${[['Never mix AI and DI', 'AI and DI signals never share a CIOC'], ['Each unit in one cabinet', 'Keep every process group in a single cabinet'], ['20% spare', 'Reserve 20% spare CHARMs on every baseplate'], ['Max 6 DO per baseplate', 'No more than 6 DO signals on any baseplate']].map((x) => `<button class="tag" data-a="eg" data-v="${E(x[0])}" data-d="${E(x[1])}">${E(x[0])}</button>`).join('')}</div></div></div>`
     + pn('CHARM and terminal block lookup <span class="mu">an IO type missing here raises a TQ</span>', `<div style="overflow-x:auto"><table><tr><th>IO type</th><th>CHARM</th><th>Terminal block</th><th></th></tr>${Object.entries(S.hw).map(([k, v]) => `<tr><td class="mono">${E(k)}</td><td><input data-h="${E(k)}:0" value="${E(v[0])}"></td><td><input data-h="${E(k)}:1" value="${E(v[1])}"></td><td><button class="ib" data-a="hwd" data-v="${E(k)}" aria-label="Remove ${E(k)}">✕</button></td></tr>`).join('')}</table></div>
     <div class="row" style="margin-top:12px"><input id="hwk" placeholder="New IO type, e.g. PI" style="width:150px"><input id="hwc" placeholder="CHARM"><input id="hwt" placeholder="Terminal block"><button class="btn s" data-a="hwa">Add IO type</button></div>
     <div class="row" style="margin-top:12px"><span class="mu">Baseplate name pattern</span><input id="pat" value="${E(S.pat)}"><span class="mono ok" id="pv">${E(nm(0, 0))}</span></div>`)
@@ -165,7 +261,8 @@ V.ru = () => {
 // Allocation
 V.re = () => {
   const ob = blocking().length, ow = openTqs().length - ob;
-  const tabs = [['map', 'Cabinet map'], ['tq', `TQs (${openTqs().length} open)`], ['ck', 'Checker']];
+  const mq = RES && RES.manualQueue ? RES.manualQueue.length : 0, mpl = RES && RES.manualPlaced ? RES.manualPlaced.length : 0;
+  const tabs = [['map', 'Cabinet map'], ['tq', `TQs (${openTqs().length} open)`]].concat(mq || mpl ? [['mp', `Manual placement (${mq} waiting)`]] : []).concat([['ck', 'Checker']]);
   let h = `<div class="row" style="margin-bottom:16px"><h1 style="font-size:1.6rem;margin:0">Allocation</h1>${curRev() ? `<span class="tag">Rev ${E(curRev().k)}</span>` : ''}<span class="mu">Cabinet to CIOC to baseplate to CHARM</span><div class="sp1 row"><button class="btn p" data-a="al" ${S.ld && !BUSY ? '' : 'disabled'}>${BUSY || (S.al ? 'Re-allocate' : 'Allocate')}</button></div></div>`
     + (dirty() ? `<div class="ban"><span class="wn">Rules, hardware, decisions or data changed since the last allocation.</span><button class="btn s p" data-a="al">Re-allocate now</button></div>` : '');
   if (S.rt !== 'tq' && !RES) return h + sub(tabs) + `<div class="pn"><div class="pb" style="text-align:center;padding:50px"><b>${S.ld ? 'Nothing allocated yet' : 'Load an IO list first'}</b>${ob ? `<p class="wn">${ob} blocking TQ${ob > 1 ? 's' : ''} need a decision first. ${ow ? ow + ' warnings will proceed with their defaults.' : ''}</p>` : `<p class="mu">${S.ld ? 'Allocate places every signal, or explains why not.' : ''}</p>`}${S.ld ? '' : '<button class="btn p" data-a="go" data-v="up">Go to Upload</button>'}</div></div>`;
@@ -173,6 +270,7 @@ V.re = () => {
   if (S.rt === 'map') h += mapTab();
   if (S.rt === 'tq') h += tqTab();
   if (S.rt === 'ck') h += ckTab();
+  if (S.rt === 'mp') h += mpTab();
   return h;
 };
 
@@ -181,27 +279,63 @@ function grid() {
   RES.placements.forEach((p) => { ((g[p.cab] = g[p.cab] || {})[p.cioc] = g[p.cab][p.cioc] || {})[p.bp * RES.H.pc + p.ch] = p; });
   return g;
 }
-function mapTab() {
-  const H = RES.H, pcEff = H.pc - RES.spare, N = RES.stats.cabinets, g = grid();
-  if (S.cab >= N) S.cab = 0;
-  let cells = '';
-  let d = 0;
+// One cabinet as a grid of CHARMs. pick=true makes free CHARMs clickable for manual placement.
+function cabGrid(cab, pick, g) {
+  const H = RES.H, pcEff = H.pc - RES.spare;
+  g = g || grid();
+  let cells = '', d = 0;
   for (let ci = 0; ci < H.cc; ci++) {
-    const cm = RES.ciocs.find((c) => c.cab === S.cab && c.cioc === ci);
+    const cm = RES.ciocs.find((c) => c.cab === cab && c.cioc === ci);
     const lab = cm ? [...new Set(cm.grps.map((x) => (x || 'No group') + (cm.segs[x] && cm.segs[x].length ? '·' + cm.segs[x].join('/') : '')))].join(', ') : 'empty';
     let r = '';
     for (let b = 0; b < H.bc; b++) {
       let row = '';
       for (let k = 0; k < H.pc; k++) {
-        const p = g[S.cab] && g[S.cab][ci] && g[S.cab][ci][b * H.pc + k];
-        const dl = (d++ % 400) * 2 + 'ms';
-        if (p) row += `<i class="c" style="--c:var(${col(p.type)});--d:${dl}" data-t="${E(p.tag)}|${E(p.type)} · ${E(p.grp || 'No group')}${p.seg ? ' Seg ' + E(p.seg) : ''}|${E((S.hw[p.type] || ['no CHARM'])[0])} · ${E((S.hw[p.type] || ['', ''])[1])}|${E(nm(S.cab, ci * H.bc + b))} · CHARM ${k + 1}|${p.cable ? E(p.cable) + ' pair ' + (p.pair ?? '?') : 'no cable'}${p.pinned ? '|pinned from earlier revision' : ''}"></i>`;
-        else row += `<i class="c ${k >= pcEff ? 'sp' : 'em'}" style="--d:${dl}" data-t="${k >= pcEff ? 'Reserved spare CHARM' : 'Free CHARM'}|${E(nm(S.cab, ci * H.bc + b))} · CHARM ${k + 1}"></i>`;
+        const p = g[cab] && g[cab][ci] && g[cab][ci][b * H.pc + k];
+        const dl = pick ? '0ms' : (d++ % 400) * 2 + 'ms', where = `${E(nm(cab, ci * H.bc + b))} · CHARM ${k + 1}`;
+        const sel = pick && MP.pos && MP.pos.cab === cab && MP.pos.cioc === ci && MP.pos.bp === b && MP.pos.ch === k;
+        if (p) row += `<i class="c ${p.manual ? 'mn' : ''}" style="--c:var(${col(p.type)});--d:${dl}" data-t="${E(p.tag)}${p.manual ? ' (placed by hand)' : ''}|${E(p.type)} · ${E(p.grp || 'No group')}${p.seg ? ' Seg ' + E(p.seg) : ''}|${E((S.hw[p.type] || ['no CHARM'])[0])} · ${E((S.hw[p.type] || ['', ''])[1])}|${where}|${p.cable ? E(p.cable) + ' pair ' + (p.pair ?? '?') : 'no cable'}${p.pinned ? '|pinned from earlier revision' : ''}"></i>`;
+        else if (pick) row += `<i class="c ${k >= pcEff ? 'sp' : 'em'} pk ${sel ? 'on' : ''}" style="--d:0ms" data-a="mpc" data-v="${cab}/${ci}/${b}/${k}" role="button" tabindex="0" aria-label="${where}" data-t="${k >= pcEff ? 'Reserved spare CHARM (placing here eats into the spare)' : 'Free CHARM'}|${where}|Click to check this slot"></i>`;
+        else row += `<i class="c ${k >= pcEff ? 'sp' : 'em'}" style="--d:${dl}" data-t="${k >= pcEff ? 'Reserved spare CHARM' : 'Free CHARM'}|${where}"></i>`;
       }
       r += `<div class="bp" style="grid-template-columns:repeat(${H.pc},1fr)">${row}</div>`;
     }
     cells += `<div class="cio"><h4>CIOC ${ci + 1}<span>${E(lab)}</span></h4>${r}</div>`;
   }
+  return cells;
+}
+
+// Manual placement: signals sent here by a "Place manually" decision. Pick a free CHARM, see what it
+// would break (the checker runs on the layout with the signal there), then place it.
+const MP = { tag: null, cab: 0, pos: null, res: null, busy: 0 };
+function mpTab() {
+  const q = RES.manualQueue || [], pl = RES.manualPlaced || [], H = RES.H;
+  if (MP.tag && !q.some((x) => x.tag === MP.tag) && !pl.some((x) => x.tag === MP.tag)) Object.assign(MP, { tag: null, pos: null, res: null });
+  const N = RES.stats.cabinets + 1; // one extra, empty cabinet to place into
+  if (MP.cab >= N) MP.cab = 0;
+  const slot = (x) => `${cabName(x.cab)} CIOC ${x.cioc + 1} · ${nm(x.cab, x.cioc * H.bc + x.bp)} · CHARM ${x.ch + 1}`;
+  const sig = q.find((x) => x.tag === MP.tag) || pl.find((x) => x.tag === MP.tag);
+  let picker = '';
+  if (MP.tag) {
+    const r = MP.res;
+    const verdict = !MP.pos ? '<span class="mu">Click a free CHARM. Grey ones are reserved spare.</span>'
+      : MP.busy ? '<span class="mu">Checking this slot…</span>'
+      : !r ? '' : !r.ok ? `<span class="er">${E(r.reason)}</span>`
+      : `<div><b>${E(slot(MP.pos))}</b>${r.spare ? ' <span class="tag w">reserved spare CHARM</span>' : ''}</div>${r.breaks.length ? `<div class="wn" style="margin-top:4px">Placing it here breaks:</div>${r.breaks.slice(0, 8).map((b) => `<div class="mono" style="font-size:12px">· ${E(b.rule)}: ${E(b.msg)}</div>`).join('')}<div class="mu" style="font-size:12px;margin-top:4px">If you place it anyway, these are logged as accepted exceptions (your manual placement).</div>` : '<div class="ok" style="margin-top:4px">Breaks no rule.</div>'}`;
+    picker = pn(`Place ${E(MP.tag)} <span class="mu">${sig ? `${E(sig.type || '?')} · ${E(sig.grp || 'No group')}${sig.seg ? ' Seg ' + E(sig.seg) : ''}${sig.cable ? ' · ' + E(sig.cable) + ' pair ' + (sig.pair ?? '?') : ''}` : ''}</span><span class="sp1 row"><button class="btn s" data-a="mpx">Cancel</button></span>`,
+      `<div class="cabs" style="flex-wrap:wrap">${Array.from({ length: N }, (_, i) => `<button class="${i == MP.cab ? 'on' : ''}" data-a="mpcab" data-v="${i}">${cabName(i)}${i === N - 1 ? ' (new)' : ''}</button>`).join('')}</div>
+      <div class="cab" style="grid-template-columns:repeat(${H.cc},minmax(190px,1fr))">${cabGrid(MP.cab, true)}</div>
+      <div class="pb" style="border:1px solid var(--ln);margin-top:12px">${verdict}<div class="row" style="margin-top:10px"><button class="btn p" data-a="mpok" ${MP.pos && r && r.ok && !MP.busy ? '' : 'disabled'}>Place here</button></div></div>`);
+  }
+  return picker
+    + pn(`Waiting for manual placement <span class="mu">${q.length} signals · sent here by “Place manually” decisions</span>`, q.length ? `<div style="overflow-x:auto"><table><tr><th>Tag</th><th>Signal</th><th>Cable</th><th>TQ</th><th></th></tr>${q.map((x) => `<tr class="${x.tag === MP.tag ? 'dr' : ''}"><td class="mono">${E(x.tag)}</td><td>${E(x.type || '?')} · ${E(x.grp || 'No group')}${x.seg ? ' Seg ' + E(x.seg) : ''}</td><td class="mono">${x.cable ? E(x.cable) + ' / ' + (x.pair ?? '?') : '-'}</td><td><span class="mono">${E(x.tq)}</span><div class="mu" style="font-size:12px">${E(x.tqTitle || '')}</div></td><td><button class="btn s ${x.tag === MP.tag ? '' : 'p'}" data-a="mps" data-v="${E(x.tag)}">${x.tag === MP.tag ? 'Selected' : 'Place'}</button></td></tr>`).join('')}</table></div>` : '<span class="ok">Nothing waiting.</span>')
+    + (pl.length ? pn(`Placed by hand <span class="mu">${pl.length}</span>`, `<div style="overflow-x:auto"><table><tr><th>Tag</th><th>Slot</th><th>By</th><th></th></tr>${pl.map((x) => `<tr><td class="mono">${E(x.tag)}</td><td class="mono">${E(slot(x))}</td><td>${E(x.who)} <span class="mu">${when(x.at)} · Rev ${E(x.rev)}</span></td><td style="white-space:nowrap"><button class="btn s" data-a="mps" data-v="${E(x.tag)}">Move</button> <button class="btn s" data-a="mprm" data-v="${E(x.tag)}">Remove</button></td></tr>`).join('')}</table></div>`) : '');
+}
+
+function mapTab() {
+  const H = RES.H, pcEff = H.pc - RES.spare, N = RES.stats.cabinets, g = grid();
+  if (S.cab >= N) S.cab = 0;
+  const cells = cabGrid(S.cab, false, g);
   const ty = {};
   RES.placements.forEach((p) => (ty[p.type] = (ty[p.type] || 0) + 1));
   const fr = Array.from({ length: N }, (_, i) => {
@@ -211,12 +345,12 @@ function mapTab() {
   }).join('');
   const rc = [['All rules as set', N, '']].concat(Object.entries(RES.costs || {}).map(([k, n]) => [ruleName(k) + ' off', n, n !== N ? ` (${n - N > 0 ? '+' : ''}${n - N})` : '']));
   const ck = RES.check.results.filter((r) => r.status !== 'unchecked');
-  return kp([[RES.stats.signals, 'signals placed'], [RES.unplaced.length, 'left unplaced (TQ)'], [N, 'cabinets'], [RES.stats.ciocs, 'CIOCs'], [RES.stats.fill + '%', 'CHARM fill'], [openTqs().length, 'open TQs'], [RES.check.violations, 'violations']])
+  return kp([[RES.stats.signals, 'signals placed'], [RES.unplaced.filter((u) => !u.pending).length, 'left unplaced (TQ)'], [(RES.manualQueue || []).length, 'awaiting manual placement'], [N, 'cabinets'], [RES.stats.ciocs, 'CIOCs'], [RES.stats.fill + '%', 'CHARM fill'], [openTqs().length, 'open TQs'], [RES.check.violations, 'violations']])
     + `<div class="row" style="margin:-4px 0 16px">${ck.map((r) => `<span class="tag ${r.status === 'fail' ? 'e' : r.status === 'accepted' ? 'h' : 'g'}" title="${E(r.note)}">${r.status === 'fail' ? '✕' : '✓'} ${E(r.name)}${r.accepted.length ? ` (${r.accepted.length} accepted)` : ''}</span>`).join('')}</div>`
-    + pn('Cabinet map', `<div class="cabs" style="flex-wrap:wrap">${Array.from({ length: N }, (_, i) => `<button class="${i == S.cab ? 'on' : ''}" data-a="cb" data-v="${i}">${cabName(i)}</button>`).join('')}</div><div class="cab" style="grid-template-columns:repeat(${H.cc},minmax(190px,1fr))">${cells}</div><div class="leg">${Object.keys(ty).map((t) => `<span><i style="background:var(${col(t)})"></i>${E(t)}</span>`).join('')}<span><i style="background:var(--sp)"></i>Reserved spare</span><span><i style="box-shadow:inset 0 0 0 1px var(--l2)"></i>Free</span></div>`)
+    + pn('Cabinet map', `<div class="cabs" style="flex-wrap:wrap">${Array.from({ length: N }, (_, i) => `<button class="${i == S.cab ? 'on' : ''}" data-a="cb" data-v="${i}">${cabName(i)}</button>`).join('')}</div><div class="cab" style="grid-template-columns:repeat(${H.cc},minmax(190px,1fr))">${cells}</div><div class="leg">${Object.keys(ty).map((t) => `<span><i style="background:var(${col(t)})"></i>${E(t)}</span>`).join('')}<span><i style="background:var(--sp)"></i>Reserved spare</span><span><i style="box-shadow:inset 0 0 0 1px var(--l2)"></i>Free</span>${RES.placements.some((p) => p.manual) ? '<span><i style="box-shadow:inset 0 0 0 2px var(--ink)"></i>Placed by hand</span>' : ''}</div>`)
     + `<div class="g2">` + pn('Signal mix and cabinet fill', `<div class="stk">${Object.entries(ty).map(([t, c]) => `<i title="${E(t)} ${c}" style="width:${(c / RES.stats.signals) * 100}%;background:var(${col(t)})"></i>`).join('')}</div><div class="leg" style="margin:8px 0 14px">${Object.entries(ty).map(([t, c]) => `<span>${E(t)} ${c}</span>`).join('')}</div><div style="overflow-x:auto"><table><tr><th>Cabinet</th><th>CIOCs</th><th>Signals</th><th>Fill</th></tr>${fr}</table></div>`)
     + pn('What each rule costs <span class="mu">cabinets with the rule off</span>', bars(rc, Math.max(...rc.map((r) => r[1])))) + `</div>`
-    + (RES.unplaced.length ? pn(`Left unplaced <span class="mu">${RES.unplaced.length} signals, each covered by a TQ decision</span>`, `<div style="overflow-x:auto"><table><tr><th>Tag</th><th>TQ</th><th>Decision</th></tr>${RES.unplaced.slice(0, 60).map((u) => `<tr><td class="mono">${E(u.tag)}</td><td class="mono">${E(u.tq)}</td><td class="mu">${E(u.reason)}</td></tr>`).join('')}</table></div>`) : '');
+    + (RES.unplaced.some((u) => !u.pending) ? pn(`Left unplaced <span class="mu">${RES.unplaced.filter((u) => !u.pending).length} signals, each covered by a TQ decision</span>`, `<div style="overflow-x:auto"><table><tr><th>Tag</th><th>TQ</th><th>Decision</th></tr>${RES.unplaced.filter((u) => !u.pending).slice(0, 60).map((u) => `<tr><td class="mono">${E(u.tag)}</td><td class="mono">${E(u.tq)}</td><td class="mu">${E(u.reason)}</td></tr>`).join('')}</table></div>`) : '');
 }
 
 function tqTab() {
@@ -310,7 +444,7 @@ function render() {
   $('#cr').innerHTML = `Project <b>${pj ? E(pj.name) : 'none'}</b> / <b>${NAV.find((n) => n[0] == S.v)[1]}</b>`;
   $('#rsel').innerHTML = (POOL ? POOL.revs : []).map((x) => `<option value="${E(x.k)}" ${S.rev == x.k ? 'selected' : ''}>Rev ${E(x.k)}</option>`).join('') || '<option>No data</option>';
   const r = curRev();
-  $('#rs').innerHTML = `<span class="live"></span><b>Data pool</b> server<br>${r ? r.signals : 0} signals · Rev <b>${r ? E(r.k) : '-'}</b><br>${S.rules.filter((x) => x.on).length} rules active · ${ot} open TQs<br>${RES ? RES.check.violations + ' unack. violations' : 'not allocated'}<br><label class="mu" style="display:block;margin-top:6px">Your name<input id="usr" value="${E(user())}" style="width:100%;margin-top:2px;padding:3px 6px"></label>`;
+  $('#rs').innerHTML = `<span class="live"></span><b>Data pool</b> server<br>${r ? r.signals : 0} signals · Rev <b>${r ? E(r.k) : '-'}</b><br>${live().filter((x) => x.on).length} rules active · ${ot} open TQs<br>${RES ? RES.check.violations + ' unack. violations' : 'not allocated'}<br><label class="mu" style="display:block;margin-top:6px">Your name<input id="usr" value="${E(user())}" style="width:100%;margin-top:2px;padding:3px 6px"></label>`;
   $('#v').innerHTML = V[S.v]();
   drawM();
 }
@@ -343,6 +477,15 @@ function startIng(d, mode) {
 }
 
 // ---------- actions ----------
+// Take an allocation response: held (show the blocking TQs) or a new result.
+function took(r, stay) {
+  POOL = r.pool;
+  if (r.blocked) { MODAL = { an: 1 }; log(`Allocation held: ${r.blocking.length} blocking TQs`); return; }
+  RES = r; S.al = 1; S.akey = akey(); MODAL = null;
+  if (!stay) { S.rt = (r.manualQueue || []).length ? 'mp' : 'map'; S.cab = 0; }
+  log(`Allocated ${r.stats.signals} signals into ${r.stats.cabinets} cabinets, checker: ${r.check.violations} violations`);
+  if (!stay) toast(`Allocated ${r.stats.signals} signals. ${(r.manualQueue || []).length ? r.manualQueue.length + ' waiting for manual placement. ' : ''}${r.check.violations} unacknowledged violations.`);
+}
 let scanT = 0;
 const rescan = () => { clearTimeout(scanT); if (!S.ld) return; scanT = setTimeout(async () => { try { POOL = await api('POST', purl('/scan'), ctx()); render(); } catch (e) { toast(e.message); } }, 400); };
 
@@ -391,20 +534,39 @@ const A = {
   hs(i) { S.rules[i].h ^= 1; render(); rescan(); },
   mv(i, e) { i = +i; const j = i + +e.dataset.d, R = S.rules; if (j >= 0 && j < R.length) { [R[i], R[j]] = [R[j], R[i]]; log('Priority changed: ' + R[j].n); } render(); rescan(); },
   del(i) { log('Deleted rule: ' + S.rules[i].n); S.rules.splice(i, 1); render(); rescan(); },
-  acc(i) { delete S.rules[i].draft; log('Accepted rule: ' + S.rules[i].n); render(); },
-  add() { const n = $('#rn').value.trim(); if (!n) return; S.rules.push({ k: 'x' + Date.now().toString(36), n, d: 'Custom rule', h: $('#rk').value == 'Hard' ? 1 : 0, on: 1 }); log('Added rule: ' + n); render(); },
-  ai() { const t = $('#ait').value.trim(); if (!t) return; S.rules.push({ k: 'x' + Date.now().toString(36), n: t[0].toUpperCase() + t.slice(1), d: /cabinet|unit|group|together/i.test(t) ? 'Grouping' : /spare|%/.test(t) ? 'Spare capacity' : /mix|never/i.test(t) ? 'Segregation' : 'Custom rule', h: /never|must|always|only|keep/i.test(t) ? 1 : 0, on: 1, draft: 1 }); log('AI filled a rule row: ' + t); render(); },
-  eg(t) { $('#ait').value = t; A.ai(); },
+  acc(i) { const r = S.rules[i]; if (!r) return; delete r.draft; delete r.pv; log('Accepted rule: ' + r.n); toast('Rule added: ' + r.n); render(); rescan(); },
+  rej(i) { const r = S.rules[i]; if (!r) return; S.rules.splice(i, 1); log('Rejected draft: ' + r.n); render(); },
+  eg(name, e) { DR.name = name; DR.desc = e.dataset.d || ''; DR.msg = ''; render(); },
+  async drf() {
+    DR.name = $('#rn').value.trim(); DR.desc = $('#rdsc').value.trim();
+    if (!DR.name && !DR.desc) { DR.msg = 'Give the rule a name and say what it must do.'; DR.err = 1; render(); return; }
+    DR.busy = 1; DR.msg = ''; render();
+    try {
+      const r = await api('POST', '/api/rules/draft', { name: DR.name, description: DR.desc, hw: S.hw, h: S.h, project: S.proj });
+      if (r.supported) { S.rules.push({ ...r.rule, ...(r.preview ? { pv: r.preview } : {}) }); DR.name = DR.desc = ''; log('Drafted rule: ' + r.rule.n); }
+      else { DR.msg = 'Could not draft this as an enforceable rule: ' + r.reason; DR.err = 0; }
+    } catch (e) { DR.msg = e.message; DR.err = 1; }
+    DR.busy = 0; render();
+  },
   js() { S.js ^= 1; render(); },
-  jsap() { try { const j = JSON.parse($('#jsn').value); if (!Array.isArray(j)) throw 0; S.rules = j.map((r) => ({ k: String(r.id), n: String(r.name), d: 'Imported', h: r.hard ? 1 : 0, on: r.on ? 1 : 0 })); log('Imported ' + j.length + ' rules from JSON'); render(); rescan(); } catch (e) { toast('Invalid JSON: expected a list of {id, name, hard, on}'); } },
+  jsap() { try { const m = applyRulesDoc(JSON.parse($('#jsn').value)); log('Imported ' + m + ' from JSON'); toast('Imported ' + m); render(); rescan(); } catch (e) { toast('Invalid rules JSON: ' + (e.message || 'could not parse')); } },
   hwa() { const k = $('#hwk').value.trim().toUpperCase(); if (!k) return; S.hw[k] = [$('#hwc').value.trim() || 'CHARM ' + k, $('#hwt').value.trim() || 'TB']; log('Added IO type ' + k); render(); rescan(); },
   hwd(k) { delete S.hw[k]; log('Removed IO type ' + k); render(); rescan(); },
   async dc(fp, e) {
     const box = e.closest('.tqx'), opt = box.querySelector('[data-tqsel]').value, c = box.querySelector('[data-tqc]');
     try {
+      const before = POOL.tqs.find((x) => x.fp === fp), o = before && before.options.find((x) => x.id === opt);
       POOL = await api('POST', purl('/tqs/decide'), { fp, opt, comment: c ? c.value : '', ...ctx() });
       const t = POOL.tqs.find((x) => x.fp === fp);
       log(`${t.id}: ${t.decision ? t.decision.label : 'decided'}`);
+      // "Turn the rule off" / "Make it soft" change the rule table itself
+      const rule = o && o.rule && S.rules.find((x) => x.k === o.rule);
+      if (o && o.act && rule) {
+        if (o.act === 'off') rule.on = 0; else rule.h = 0;
+        log(`${o.act === 'off' ? 'Turned off' : 'Made soft'}: ${rule.n}`);
+        toast(`${rule.n} is now ${o.act === 'off' ? 'off' : 'soft'}. Re-allocate to apply.`);
+        rescan();
+      } else if (opt === 'manual') toast(`${t.count} signal${t.count > 1 ? 's' : ''} will wait in Manual placement after you allocate.`);
     } catch (x) { toast(x.message); }
     render();
   },
@@ -412,24 +574,49 @@ const A = {
   async al() {
     if (!S.ld) return;
     BUSY = 'Allocating…'; render();
+    try { took(await api('POST', purl('/allocate'), ctx())); } catch (e) { toast(e.message); }
+    BUSY = ''; render();
+  },
+  async hint(fp) {
+    HB.add(fp); render();
+    try { POOL = await api('POST', purl('/tqs/hint'), { fp, ...ctx() }); } catch (e) { toast(e.message); }
+    HB.delete(fp); render();
+  },
+  mps(tag) { Object.assign(MP, { tag, pos: null, res: null }); const x = (RES.manualPlaced || []).find((y) => y.tag === tag); if (x) MP.cab = x.cab; render(); },
+  mpx() { Object.assign(MP, { tag: null, pos: null, res: null }); render(); },
+  mpcab(i) { MP.cab = +i; MP.pos = null; MP.res = null; render(); },
+  async mpc(v) {
+    const [cab, cioc, bp, ch] = v.split('/').map(Number);
+    Object.assign(MP, { pos: { cab, cioc, bp, ch }, res: null, busy: 1 }); render();
+    try { MP.res = await api('POST', purl('/manual/check'), { tag: MP.tag, pos: MP.pos, ...ctx() }); } catch (e) { MP.res = { ok: false, reason: e.message }; }
+    MP.busy = 0; render();
+  },
+  async mpok() {
+    if (!MP.tag || !MP.pos) return;
+    const tag = MP.tag;
+    BUSY = 'Placing…'; render();
     try {
-      const r = await api('POST', purl('/allocate'), ctx());
-      POOL = r.pool;
-      if (r.blocked) {
-        MODAL = { an: 1 };
-        log(`Allocation held: ${r.blocking.length} blocking TQs`);
-      } else {
-        RES = r; S.al = 1; S.akey = akey(); MODAL = null; S.rt = 'map'; S.cab = 0;
-        log(`Allocated ${r.stats.signals} signals into ${r.stats.cabinets} cabinets, checker: ${r.check.violations} violations`);
-        toast(`Allocated ${r.stats.signals} signals. ${r.check.violations} unacknowledged violations.`);
-      }
+      took(await api('POST', purl('/manual/place'), { tag, pos: MP.pos, ...ctx() }), true);
+      log(`Placed ${tag} by hand`); toast(`${tag} placed. The checker re-verified the layout.`);
+      Object.assign(MP, { tag: null, pos: null, res: null });
     } catch (e) { toast(e.message); }
+    BUSY = ''; render();
+  },
+  async mprm(tag) {
+    BUSY = 'Updating…'; render();
+    try { took(await api('POST', purl('/manual/remove'), { tag, ...ctx() }), true); log(`${tag} back in the manual queue`); } catch (e) { toast(e.message); }
     BUSY = ''; render();
   },
   async rvd() { try { POOL = await api('DELETE', purl('/revs/last'), {}); await loadPool(); log('Removed the latest revision'); } catch (e) { toast(e.message); } render(); },
   rt(v) { S.rt = v; render(); }, cb(i) { S.cab = +i; render(); }, tf(v) { S.tqf = v; render(); },
   rev(v) { S.rev = v; render(); },
   mtq() { MODAL = null; S.v = 're'; S.rt = 'tq'; S.tqf = 'open'; render(); }, xm() { MODAL = null; drawM(); }, noop() {},
+  xr() {
+    if (!S.proj) return;
+    const r = curRev();
+    download(`rules-${slug(P() && P().name)}${r ? '-rev-' + r.k : ''}.json`, JSON.stringify(rulesDoc(), null, 2), 'application/json');
+    log('Exported rules.json');
+  },
   xl() { if (!RES) return toast('Allocate first, then export'); location.href = purl('/export.csv?pat=' + encodeURIComponent(S.pat)); log('Exported allocation CSV'); },
   async fz() {
     S.fz = { runs: 0, violations: 0, signals: 0, tqs: 0, running: 1 }; render();
@@ -457,6 +644,8 @@ document.addEventListener('input', (e) => {
   if (h) { const [k, i] = h.split(':'); S.hw[k][i] = e.target.value; sv(); }
   if (e.target.id == 'pat') { S.pat = e.target.value; $('#pv').textContent = nm(0, 0); sv(); }
   if (e.target.id == 'usr') setUser(e.target.value);
+  if (e.target.id == 'rn') DR.name = e.target.value;
+  if (e.target.id == 'rdsc') DR.desc = e.target.value;
 });
 document.addEventListener('change', (e) => {
   const t = e.target;
@@ -466,6 +655,12 @@ document.addEventListener('change', (e) => {
   if (t.dataset.mf && ING) { const [i, f] = t.dataset.mf.split(':'); ING.maps[+i].map[f] = t.value; render(); }
   if (t.dataset.inc && ING) { ING.inc[t.dataset.inc] = t.checked; render(); }
   if (t.id == 'rsel') A.rev(t.value);
+  if (t.id == 'rjf' && t.files[0]) {
+    const f = t.files[0]; t.value = '';
+    if (f.size > 2e6) { toast('rules.json is too large'); return; }
+    f.text().then((x) => { const m = applyRulesDoc(JSON.parse(x)); log('Imported ' + m + ' from ' + f.name); toast('Imported ' + m); render(); rescan(); })
+      .catch((e) => toast('Could not import ' + f.name + ': ' + (e.message || 'invalid JSON')));
+  }
 });
 ['dragover', 'dragleave', 'drop'].forEach((v) => document.addEventListener(v, (e) => {
   const z = e.target.closest && e.target.closest('#drop,#rdrop');
@@ -476,11 +671,20 @@ document.addEventListener('change', (e) => {
 }));
 const tip = $('#tip');
 document.addEventListener('mousemove', (e) => {
-  const c = e.target.closest && e.target.closest('.c');
-  if (!c || !c.dataset.t) { tip.style.display = 'none'; return; }
-  tip.innerHTML = c.dataset.t.split('|').map(E).join('<br>');
+  const c = e.target.closest && e.target.closest('.c, [data-tip]');
+  const t = c && (c.dataset.t || c.dataset.tip);
+  if (!t) { tip.style.display = 'none'; return; }
+  tip.innerHTML = c.dataset.t ? t.split('|').map(E).join('<br>') : E(t);
   tip.style.display = 'block'; tip.style.left = Math.min(e.clientX + 14, innerWidth - 260) + 'px'; tip.style.top = e.clientY + 14 + 'px';
 });
+// Enter / Space on clickable CHARMs (manual placement) acts like a click
+document.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if ((e.key === 'Enter' || e.key === ' ') && t.getAttribute && t.getAttribute('role') === 'button' && t.dataset.a && A[t.dataset.a]) { e.preventDefault(); A[t.dataset.a](t.dataset.v, t); }
+});
+// keyboard users get the same rule explanation on focus
+document.addEventListener('focusin', (e) => { const t = e.target.dataset && e.target.dataset.tip; if (!t) return; const b = e.target.getBoundingClientRect(); tip.textContent = t; tip.style.display = 'block'; tip.style.left = Math.min(b.left, innerWidth - 360) + 'px'; tip.style.top = b.bottom + 6 + 'px'; });
+document.addEventListener('focusout', () => (tip.style.display = 'none'));
 addEventListener('pagehide', () => { const p = P(); if (p) { p.st = snap(); navigator.sendBeacon('/api/projects/' + p.id, new Blob([JSON.stringify(p)], { type: 'application/json' })); } });
 
 log('Session started');
